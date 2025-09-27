@@ -1,0 +1,1385 @@
+import React, { useState } from 'react'
+import { motion, AnimatePresence } from 'framer-motion'
+import {
+  BeakerIcon,
+  MapPinIcon,
+  SparklesIcon,
+  TrophyIcon,
+  ShieldCheckIcon,
+  ExclamationTriangleIcon
+} from '@heroicons/react/24/outline'
+import { toast } from 'react-hot-toast'
+import { weatherService, type WeatherData, type ClimateData } from '../services/weatherService'
+import { soilService, type SoilData } from '../services/soilService'
+import { geocodingService, type Coordinates } from '../services/geocodingService'
+import { marketPriceService, type MarketPrice } from '../services/marketPriceService'
+
+interface FormData {
+  location: string
+  coordinates: { lat: number; lng: number } | null
+  soilType: string
+  soilPh: string
+  nitrogen: string
+  phosphorus: string
+  potassium: string
+}
+
+interface LocationData {
+  name: string
+  coordinates: Coordinates
+  weather: WeatherData
+  climate: ClimateData
+  soil: SoilData
+  marketPrices: MarketPrice[]
+}
+
+interface CropRecommendation {
+  name: string
+  confidence: number
+  expectedYield: string
+  profitMargin: string
+  investmentRequired: string
+  duration: string
+  difficulty: 'Easy' | 'Medium' | 'Hard'
+  marketDemand: 'High' | 'Medium' | 'Low'
+  waterRequirement: 'Low' | 'Medium' | 'High'
+  pros: string[]
+  cons: string[]
+  tips: string[]
+  emoji: string
+}
+
+const CropRecommendation: React.FC = () => {
+  const [formData, setFormData] = useState<FormData>({
+    location: '',
+    coordinates: null,
+    soilType: '',
+    soilPh: '',
+    nitrogen: '',
+    phosphorus: '',
+    potassium: ''
+  })
+  
+  const [isAnalyzing, setIsAnalyzing] = useState(false)
+  const [recommendations, setRecommendations] = useState<CropRecommendation[] | null>(null)
+  const [isLocationLoading, setIsLocationLoading] = useState(false)
+  const [locationData, setLocationData] = useState<LocationData | null>(null)
+  const [useCurrentLocation, setUseCurrentLocation] = useState(false)
+
+
+  const soilTypes = ['Loamy', 'Clay', 'Sandy', 'Silt', 'Red Soil', 'Black Soil', 'Laterite']
+
+  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
+    const { name, value } = e.target
+    setFormData(prev => ({ ...prev, [name]: value }))
+    
+    // Auto-fetch location data when location name is entered
+    if (name === 'location' && value.length > 2 && !useCurrentLocation) {
+      debouncedFetchLocationData(value)
+    }
+  }
+
+  // Debounced function to avoid too many API calls while typing
+  const debouncedFetchLocationData = (() => {
+    let timeoutId: NodeJS.Timeout
+    return (locationName: string) => {
+      clearTimeout(timeoutId)
+      timeoutId = setTimeout(() => {
+        fetchLocationDataByName(locationName)
+      }, 1000)
+    }
+  })()
+
+  // Get current GPS location using real geocoding service
+  const getCurrentLocation = async () => {
+    setIsLocationLoading(true)
+    setUseCurrentLocation(true)
+
+    // Add loading toast
+    const loadingToast = toast.loading('Getting your GPS location...', {
+      duration: 8000
+    })
+
+    try {
+      // Get GPS coordinates
+      const coordinates = await geocodingService.getCurrentLocation()
+      
+      toast.success('GPS location detected successfully!', {
+        id: loadingToast
+      })
+      
+      setFormData(prev => ({ ...prev, coordinates }))
+      
+      // Fetch comprehensive location data using real APIs
+      await fetchLocationDataByCoordinates(coordinates)
+      
+    } catch (error) {
+      console.error('Location detection failed:', error)
+      
+      // Provide better error handling and fallback
+      let errorMessage = 'GPS failed'
+      let helpText = ''
+      
+      if (error instanceof Error) {
+        if (error.message.includes('denied')) {
+          errorMessage = '🚫 Location access denied'
+          helpText = 'Please click the location icon in your browser address bar and allow location access, then try again.'
+        } else if (error.message.includes('unavailable')) {
+          errorMessage = '📍 Location unavailable'
+          helpText = 'GPS service is not available. Using regional fallback.'
+        } else if (error.message.includes('timeout')) {
+          errorMessage = '⏰ GPS timeout'
+          helpText = 'Location request took too long. Using regional fallback.'
+        } else if (error.message.includes('not supported')) {
+          errorMessage = '🚫 GPS not supported'
+          helpText = 'Your browser does not support location services.'
+        } else {
+          errorMessage = '❌ GPS error'
+          helpText = error.message
+        }
+      }
+      
+      // Show error with automatic fallback
+      toast.error(`${errorMessage}\n${helpText}\n\n✅ Auto-switched to Palghar, Maharashtra`, {
+        id: loadingToast,
+        duration: 6000
+      })
+      
+      // Automatically use Palghar, Maharashtra as fallback
+      const fallbackLocation = 'Palghar, Maharashtra'
+      setFormData(prev => ({ 
+        ...prev, 
+        location: fallbackLocation 
+      }))
+      
+      // Automatically fetch data for fallback location
+      try {
+        toast.loading('Loading regional data...', { duration: 3000 })
+        await fetchLocationDataByName(fallbackLocation)
+        toast.success('✅ Regional data loaded successfully! You can now get crop recommendations.')
+      } catch (fallbackError) {
+        console.error('Fallback location also failed:', fallbackError)
+        toast.error('Please enter your location manually in the text field above.')
+      }
+      
+      setUseCurrentLocation(false)
+    } finally {
+      setIsLocationLoading(false)
+    }
+  }
+
+  // Unified function to fetch location data (used by analyzeData)
+  const fetchLocationData = async () => {
+    if (!formData.location) {
+      throw new Error('Location is required')
+    }
+
+    if (formData.coordinates) {
+      await fetchLocationDataByCoordinates(formData.coordinates)
+    } else {
+      await fetchLocationDataByName(formData.location)
+    }
+  }
+
+  // Fetch comprehensive location data using real APIs
+  const fetchLocationDataByCoordinates = async (coordinates: Coordinates) => {
+    try {
+      toast.loading('Fetching location data...', { id: 'location-fetch' })
+      
+      // Run all API calls in parallel for better performance
+      const [reverseGeoResult, weatherData, climateData, soilData, marketPrices] = await Promise.all([
+        geocodingService.reverseGeocode(coordinates),
+        weatherService.getCurrentWeather(coordinates.lat, coordinates.lng),
+        weatherService.getClimateData(coordinates.lat, coordinates.lng),
+        soilService.getSoilData(coordinates.lat, coordinates.lng),
+        marketPriceService.getNearbyMarketPrices(coordinates, 100)
+      ])
+      
+      // Create comprehensive location data
+      const locationData: LocationData = {
+        name: reverseGeoResult.address.formattedAddress,
+        coordinates,
+        weather: weatherData,
+        climate: climateData,
+        soil: soilData,
+        marketPrices: marketPrices.slice(0, 10) // Limit to top 10
+      }
+      
+      // Auto-fill form with real soil data
+      setFormData(prev => ({ 
+        ...prev, 
+        location: reverseGeoResult.name,
+        coordinates,
+        soilType: soilData.soilType,
+        soilPh: soilData.ph.toString(),
+        nitrogen: soilData.nitrogen.toString(),
+        phosphorus: soilData.phosphorus.toString(),
+        potassium: soilData.potassium.toString()
+      }))
+      
+      setLocationData(locationData)
+      toast.success('Real location data loaded successfully!', { id: 'location-fetch' })
+      
+    } catch (error) {
+      console.error('Failed to fetch location data:', error)
+      toast.error('Failed to fetch location data - using regional estimates', { id: 'location-fetch' })
+      
+      // Fallback to basic location data
+      try {
+        const reverseGeoResult = await geocodingService.reverseGeocode(coordinates)
+        setFormData(prev => ({ ...prev, location: reverseGeoResult.name, coordinates }))
+      } catch (geoError) {
+        console.warn('Geocoding also failed, using coordinate-based fallback:', geoError)
+        
+        // Final fallback with coordinate-based location estimation
+        const fallbackLocation = `Coordinates: ${coordinates.lat.toFixed(4)}, ${coordinates.lng.toFixed(4)}`
+        setFormData(prev => ({ 
+          ...prev, 
+          location: fallbackLocation, 
+          coordinates,
+          // Set basic soil values as fallback
+          soilType: 'Loamy',
+          soilPh: '6.5',
+          nitrogen: '180',
+          phosphorus: '25',
+          potassium: '150'
+        }))
+        
+        // Create minimal location data to allow analysis to continue
+        const fallbackLocationData: LocationData = {
+          name: fallbackLocation,
+          coordinates,
+          weather: {
+            temperature: 28,
+            humidity: 65,
+            rainfall: 0,
+            windSpeed: 5,
+            pressure: 1013,
+            description: 'Clear sky',
+            icon: '01d',
+            feelsLike: 30,
+            visibility: 10
+          },
+          climate: {
+            avgTemperature: 28,
+            avgRainfall: 800,
+            avgHumidity: 65,
+            climate: 'Tropical',
+            season: 'Summer'
+          },
+          soil: {
+            soilType: 'Loamy',
+            ph: 6.5,
+            nitrogen: 180,
+            phosphorus: 25,
+            potassium: 150,
+            organicMatter: 2.5,
+            fertility: 'Medium' as 'Low' | 'Medium' | 'High',
+            moisture: 60
+          },
+          marketPrices: []
+        }
+        
+        setLocationData(fallbackLocationData)
+        toast.success('Using estimated regional data for your location', { id: 'location-fetch' })
+      }
+    }
+  }
+
+  // Fetch location data by place name using real geocoding API
+  const fetchLocationDataByName = async (placeName: string) => {
+    setIsLocationLoading(true)
+    
+    try {
+      // Use real geocoding service
+      const locationResult = await geocodingService.geocodePlace(placeName)
+      
+      // Fetch comprehensive data for the location
+      await fetchLocationDataByCoordinates(locationResult.coordinates)
+      
+    } catch (error) {
+      console.error('Failed to fetch location data:', error)
+      
+      // Only show error if it's not during typing (length > 4 suggests intentional input)
+      if (placeName.length > 4) {
+        // Create fallback data for Maharashtra region
+        const fallbackLocationData: LocationData = {
+          name: `${placeName} (estimated location)`,
+          coordinates: { lat: 19.0760, lng: 72.8777 }, // Mumbai coordinates as fallback
+          weather: {
+            temperature: 28,
+            humidity: 65,
+            rainfall: 2,
+            windSpeed: 6,
+            pressure: 1013,
+            description: 'Partly cloudy',
+            icon: '02d',
+            feelsLike: 31,
+            visibility: 12
+          },
+          climate: {
+            avgTemperature: 28,
+            avgRainfall: 850,
+            avgHumidity: 68,
+            climate: 'Tropical Monsoon',
+            season: 'Summer'
+          },
+          soil: {
+            soilType: 'Red Soil',
+            ph: 6.2,
+            nitrogen: 190,
+            phosphorus: 28,
+            potassium: 160,
+            organicMatter: 2.8,
+            fertility: 'Medium' as 'Low' | 'Medium' | 'High',
+            moisture: 65
+          },
+          marketPrices: []
+        }
+        
+        // Auto-fill form with fallback data
+        setFormData(prev => ({ 
+          ...prev, 
+          location: placeName,
+          coordinates: fallbackLocationData.coordinates,
+          soilType: fallbackLocationData.soil.soilType,
+          soilPh: fallbackLocationData.soil.ph.toString(),
+          nitrogen: fallbackLocationData.soil.nitrogen.toString(),
+          phosphorus: fallbackLocationData.soil.phosphorus.toString(),
+          potassium: fallbackLocationData.soil.potassium.toString()
+        }))
+        
+        setLocationData(fallbackLocationData)
+        
+        toast.success(
+          `Using regional estimates for ${placeName}. You can still proceed with crop recommendations!`,
+          { duration: 4000 }
+        )
+      }
+    } finally {
+      setIsLocationLoading(false)
+    }
+  }
+
+  // Generate AI-powered crop recommendations based on real data
+  const generateCropRecommendations = (locationData: LocationData): CropRecommendation[] => {
+    const { weather, climate, soil, marketPrices } = locationData
+    
+    // Simplified crop analysis with seasonal bonuses
+    const cropAnalysis = [
+      {
+        name: 'Onion',
+        suitability: analyzeCropSuitability('onion', weather, climate, soil),
+        marketPrice: findMarketPrice(marketPrices, 'onion'),
+        emoji: '🧅'
+      },
+      {
+        name: 'Cotton',
+        suitability: analyzeCropSuitability('cotton', weather, climate, soil),
+        marketPrice: findMarketPrice(marketPrices, 'cotton'),
+        emoji: '🌱'
+      },
+      {
+        name: 'Chili (Red)',
+        suitability: analyzeCropSuitability('chili', weather, climate, soil),
+        marketPrice: findMarketPrice(marketPrices, 'chili'),
+        emoji: '🌶️'
+      },
+      {
+        name: 'Soybean',
+        suitability: analyzeCropSuitability('soybean', weather, climate, soil),
+        marketPrice: findMarketPrice(marketPrices, 'soybean'),
+        emoji: '🌿'
+      },
+      {
+        name: 'Sugarcane',
+        suitability: analyzeCropSuitability('sugarcane', weather, climate, soil),
+        marketPrice: findMarketPrice(marketPrices, 'sugarcane'),
+        emoji: '🎋'
+      },
+      {
+        name: 'Banana',
+        suitability: analyzeCropSuitability('banana', weather, climate, soil),
+        marketPrice: findMarketPrice(marketPrices, 'banana'),
+        emoji: '🍌'
+      },
+      {
+        name: 'Potato',
+        suitability: analyzeCropSuitability('potato', weather, climate, soil),
+        marketPrice: findMarketPrice(marketPrices, 'potato'),
+        emoji: '🥔'
+      },
+      {
+        name: 'Groundnut',
+        suitability: analyzeCropSuitability('groundnut', weather, climate, soil),
+        marketPrice: findMarketPrice(marketPrices, 'groundnut'),
+        emoji: '🥜'
+      }
+    ]
+    
+    // Sort by suitability score and take top 3
+    return cropAnalysis
+      .sort((a, b) => b.suitability.score - a.suitability.score)
+      .slice(0, 3)
+      .map((crop, index) => ({
+        name: crop.name,
+        confidence: Math.max(65, Math.min(95, crop.suitability.score)),
+        expectedYield: calculateExpectedYield(crop.name, soil, climate),
+        profitMargin: calculateProfitMargin(crop.name, crop.marketPrice),
+        investmentRequired: calculateInvestment(crop.name),
+        duration: getCropDuration(crop.name),
+        difficulty: index === 0 ? 'Easy' : index === 1 ? 'Medium' : 'Hard' as 'Easy' | 'Medium' | 'Hard',
+        marketDemand: 'High' as 'High' | 'Medium' | 'Low',
+        waterRequirement: getWaterRequirement(crop.name) as 'Low' | 'Medium' | 'High',
+        pros: generatePros(crop.name, crop.suitability, weather, soil),
+        cons: generateCons(crop.name, weather, soil),
+        tips: generateTips(crop.name, soil, climate),
+        emoji: crop.emoji
+      }))
+  }
+
+  // Analyze crop suitability based on real environmental data
+    return cropAnalysis
+      .sort((a, b) => b.suitability.score - a.suitability.score)
+      .slice(0, 3)
+      .map((crop, index) => ({
+        name: crop.name,
+        confidence: crop.suitability.score,
+        expectedYield: calculateExpectedYield(crop.name, soil, climate),
+        profitMargin: calculateProfitMargin(crop.name, crop.marketPrice),
+        investmentRequired: calculateInvestment(crop.name),
+        duration: getCropDuration(crop.name),
+        difficulty: index === 0 ? 'Easy' : index === 1 ? 'Medium' : 'Hard' as 'Easy' | 'Medium' | 'Hard',
+        marketDemand: crop.marketPrice ? 'High' : 'Medium' as 'High' | 'Medium' | 'Low',
+        waterRequirement: getWaterRequirement(crop.name) as 'Low' | 'Medium' | 'High',
+        pros: generatePros(crop.name, crop.suitability, weather, soil),
+        cons: generateCons(crop.name, weather, soil),
+        tips: generateTips(crop.name, soil, climate),
+        emoji: crop.emoji
+      }))
+  }
+  
+  // Analyze crop suitability based on real environmental data
+  const analyzeCropSuitability = (cropType: string, weather: WeatherData, climate: ClimateData, soil: SoilData) => {
+    let score = 0
+    const factors: string[] = []
+    
+    // Temperature suitability
+    const tempScore = getTemperatureScore(cropType, weather.temperature)
+    score += tempScore
+    if (tempScore > 15) factors.push('Temperature is optimal for this crop')
+    
+    // Soil pH suitability
+    const phScore = getPhScore(cropType, soil.ph)
+    score += phScore
+    if (phScore > 15) factors.push('Soil pH level is suitable')
+    
+    // Nutrient availability
+    const nutrientScore = getNutrientScore(cropType, soil)
+    score += nutrientScore
+    if (nutrientScore > 15) factors.push('Soil nutrients are adequate')
+    
+    // Climate suitability
+    const climateScore = getClimateScore(cropType, climate)
+    score += climateScore
+    if (climateScore > 10) factors.push('Climate conditions are favorable')
+    
+    return { score: Math.min(score, 100), factors }
+  }
+  
+  // Helper functions for crop analysis
+  const getTemperatureScore = (cropType: string, temp: number): number => {
+    const tempRanges: {[key: string]: {min: number, max: number, optimal: number}} = {
+      rice: { min: 20, max: 37, optimal: 30 },
+      wheat: { min: 12, max: 25, optimal: 20 },
+      tomato: { min: 18, max: 29, optimal: 24 },
+      cotton: { min: 18, max: 35, optimal: 27 },
+      maize: { min: 15, max: 35, optimal: 25 },
+      sugarcane: { min: 20, max: 40, optimal: 32 },
+      onion: { min: 15, max: 30, optimal: 22 },
+      soybean: { min: 20, max: 35, optimal: 28 },
+      chili: { min: 20, max: 35, optimal: 28 },
+      banana: { min: 22, max: 35, optimal: 30 },
+      potato: { min: 10, max: 25, optimal: 18 },
+      groundnut: { min: 20, max: 35, optimal: 28 }
+    }
+    
+    const range = tempRanges[cropType.toLowerCase()] || tempRanges.rice
+    if (temp < range.min || temp > range.max) return 0
+    
+    const deviation = Math.abs(temp - range.optimal)
+    return Math.max(0, 25 - deviation * 2)
+  }
+  
+  const getPhScore = (cropType: string, ph: number): number => {
+    const phRanges: {[key: string]: {min: number, max: number}} = {
+      rice: { min: 5.5, max: 7.0 },
+      wheat: { min: 6.0, max: 7.5 },
+      tomato: { min: 6.0, max: 6.8 },
+      cotton: { min: 5.8, max: 8.0 },
+      maize: { min: 6.0, max: 7.0 },
+      sugarcane: { min: 6.0, max: 7.5 },
+      onion: { min: 6.0, max: 7.5 },
+      soybean: { min: 6.0, max: 7.0 },
+      chili: { min: 6.0, max: 7.0 },
+      banana: { min: 5.5, max: 7.0 },
+      potato: { min: 5.2, max: 6.4 },
+      groundnut: { min: 6.0, max: 7.0 }
+    }
+    
+    const range = phRanges[cropType.toLowerCase()] || phRanges.rice
+    if (ph >= range.min && ph <= range.max) return 25
+    
+    const deviation = Math.min(Math.abs(ph - range.min), Math.abs(ph - range.max))
+    return Math.max(0, 25 - deviation * 5)
+  }
+  
+  const getNutrientScore = (cropType: string, soil: SoilData): number => {
+    let score = 0
+    
+    // Nitrogen requirements (crop-specific)
+    const nitrogenRequirement = cropType === 'rice' ? 200 : cropType === 'tomato' ? 250 : 180
+    if (soil.nitrogen > nitrogenRequirement) score += 8
+    else if (soil.nitrogen > nitrogenRequirement * 0.75) score += 5
+    
+    // Phosphorus requirements
+    const phosphorusRequirement = cropType === 'tomato' ? 30 : 25
+    if (soil.phosphorus > phosphorusRequirement) score += 8
+    else if (soil.phosphorus > phosphorusRequirement * 0.6) score += 5
+    
+    // Potassium requirements
+    const potassiumRequirement = ['cotton', 'tomato'].includes(cropType) ? 200 : 150
+    if (soil.potassium > potassiumRequirement) score += 9
+    else if (soil.potassium > potassiumRequirement * 0.67) score += 6
+    
+    return score
+  }
+  
+  const getClimateScore = (cropType: string, climate: ClimateData): number => {
+    const { season, avgRainfall } = climate
+    
+    // Season-based scoring
+    let seasonScore = 0
+    if (cropType === 'rice' && season === 'Monsoon') seasonScore = 10
+    else if (cropType === 'wheat' && season === 'Winter') seasonScore = 10
+    else if (['tomato', 'cotton'].includes(cropType) && season !== 'Monsoon') seasonScore = 8
+    else seasonScore = 5
+    
+    // Rainfall scoring
+    let rainfallScore = 0
+    if (cropType === 'rice' && avgRainfall > 1000) rainfallScore = 10
+    else if (['wheat', 'cotton'].includes(cropType) && avgRainfall > 600 && avgRainfall < 1200) rainfallScore = 10
+    else if (avgRainfall > 400) rainfallScore = 6
+    else rainfallScore = 2
+    
+    return seasonScore + rainfallScore
+  }
+  
+  // Market price finder
+  const findMarketPrice = (marketPrices: MarketPrice[], cropType: string): MarketPrice | undefined => {
+    return marketPrices.find(price => 
+      price.commodity.toLowerCase().includes(cropType.toLowerCase())
+    )
+  }
+  
+  // Calculate expected yield based on soil and climate
+  const calculateExpectedYield = (cropType: string, soil: SoilData, climate: ClimateData): string => {
+    const baseYields: {[key: string]: number} = {
+      'Rice (Basmati)': 4.5,
+      'Tomato (Hybrid)': 45,
+      'Wheat': 3.8,
+      'Cotton': 1.2,
+      'Maize (Corn)': 5.5,
+      'Sugarcane': 80,
+      'Onion': 25,
+      'Soybean': 2.8,
+      'Chili (Red)': 3.5,
+      'Banana': 35,
+      'Potato': 28,
+      'Groundnut': 3.2
+    }
+    
+    let baseYield = baseYields[cropType] || 3.0
+    
+    // Adjust based on soil fertility
+    if (soil.fertility === 'High') baseYield *= 1.2
+    else if (soil.fertility === 'Low') baseYield *= 0.8
+    
+    // Adjust based on climate
+    if (climate.avgRainfall > 1200 && cropType.includes('Rice')) baseYield *= 1.1
+    if (climate.avgRainfall < 600) baseYield *= 0.9
+    
+    const minYield = Math.round(baseYield * 0.9 * 10) / 10
+    const maxYield = Math.round(baseYield * 1.1 * 10) / 10
+    
+    const unit = cropType.includes('Tomato') ? 'tons/hectare' : 'tons/hectare'
+    return `${minYield}-${maxYield} ${unit}`
+  }
+  
+  // Calculate profit margin using real market prices
+  const calculateProfitMargin = (cropType: string, marketPrice?: MarketPrice): string => {
+    const price = marketPrice?.price || getDefaultPrice(cropType)
+    
+    // Calculate profit based on yield and costs
+    const yieldMultipliers: {[key: string]: number} = {
+      'Rice (Basmati)': 50, // quintals per hectare
+      'Tomato (Hybrid)': 450, // quintals per hectare
+      'Wheat': 38,
+      'Cotton': 12,
+      'Maize (Corn)': 55
+    }
+    
+    const costs: {[key: string]: number} = {
+      'Rice (Basmati)': 40000,
+      'Tomato (Hybrid)': 80000,
+      'Wheat': 28000,
+      'Cotton': 35000,
+      'Maize (Corn)': 30000
+    }
+    
+    const yieldQtl = yieldMultipliers[cropType] || 40
+    const cost = costs[cropType] || 35000
+    const revenue = price * yieldQtl
+    const profit = revenue - cost
+    
+    const minProfit = Math.round(profit * 0.8)
+    const maxProfit = Math.round(profit * 1.2)
+    
+    return `₹${minProfit.toLocaleString()} - ₹${maxProfit.toLocaleString()}/hectare`
+  }
+  
+  const getDefaultPrice = (cropType: string): number => {
+    const prices: {[key: string]: number} = {
+      'Rice (Basmati)': 2850,
+      'Tomato (Hybrid)': 2200,
+      'Wheat': 2240,
+      'Cotton': 5800,
+      'Maize (Corn)': 1980,
+      'Sugarcane': 3200,
+      'Onion': 1800,
+      'Soybean': 4200,
+      'Chili (Red)': 8500,
+      'Banana': 1500,
+      'Potato': 1200,
+      'Groundnut': 5500
+    }
+    return prices[cropType] || 2000
+  }
+  
+  const calculateInvestment = (cropType: string): string => {
+    const investments: {[key: string]: number} = {
+      'Rice (Basmati)': 40000,
+      'Tomato (Hybrid)': 80000,
+      'Wheat': 28000,
+      'Cotton': 35000,
+      'Maize (Corn)': 30000,
+      'Sugarcane': 65000,
+      'Onion': 45000,
+      'Soybean': 25000,
+      'Chili (Red)': 55000,
+      'Banana': 85000,
+      'Potato': 50000,
+      'Groundnut': 32000
+    }
+    return `₹${(investments[cropType] || 35000).toLocaleString()}/hectare`
+  }
+  
+  const getCropDuration = (cropType: string): string => {
+    const durations: {[key: string]: string} = {
+      'Rice (Basmati)': '120-150 days',
+      'Tomato (Hybrid)': '90-120 days',
+      'Wheat': '110-130 days',
+      'Cotton': '160-200 days',
+      'Maize (Corn)': '90-110 days',
+      'Sugarcane': '12-18 months',
+      'Onion': '120-150 days',
+      'Soybean': '90-120 days',
+      'Chili (Red)': '90-120 days',
+      'Banana': '12-15 months',
+      'Potato': '80-100 days',
+      'Groundnut': '100-130 days'
+    }
+    return durations[cropType] || '90-120 days'
+  }
+  
+  const getWaterRequirement = (cropType: string): string => {
+    const requirements: {[key: string]: string} = {
+      'Rice (Basmati)': 'High',
+      'Tomato (Hybrid)': 'High',
+      'Wheat': 'Medium',
+      'Cotton': 'Medium',
+      'Maize (Corn)': 'Medium',
+      'Sugarcane': 'High',
+      'Onion': 'Medium',
+      'Soybean': 'Medium',
+      'Chili (Red)': 'Medium',
+      'Banana': 'High',
+      'Potato': 'Medium',
+      'Groundnut': 'Low'
+    }
+    return requirements[cropType] || 'Medium'
+  }
+  
+  const generatePros = (cropType: string, suitability: any, weather: WeatherData, soil: SoilData): string[] => {
+    const pros: string[] = []
+    
+    if (suitability.score > 80) pros.push('Excellent environmental conditions for this crop')
+    if (weather.temperature >= 20 && weather.temperature <= 30) pros.push('Optimal temperature range')
+    if (soil.fertility === 'High') pros.push('High soil fertility supports good yields')
+    if (soil.ph >= 6.0 && soil.ph <= 7.5) pros.push('Ideal soil pH for nutrient uptake')
+    
+    // Crop-specific pros
+    const cropSpecificPros: {[key: string]: string[]} = {
+      'Rice (Basmati)': ['Premium variety with export potential', 'High market value', 'Government MSP support'],
+      'Tomato (Hybrid)': ['High profit margins possible', 'Multiple harvests per year', 'Processing industry demand'],
+      'Wheat': ['Stable government procurement', 'Low risk crop', 'Well-established supply chains'],
+      'Cotton': ['Export potential', 'Textile industry demand', 'Mechanization friendly'],
+      'Maize (Corn)': ['Versatile crop uses', 'Animal feed demand', 'Industrial applications']
+    }
+    
+    pros.push(...(cropSpecificPros[cropType] || []).slice(0, 2))
+    
+    return pros.slice(0, 4)
+  }
+  
+  const generateCons = (cropType: string, weather: WeatherData, soil: SoilData): string[] => {
+    const cons: string[] = []
+    
+    if (weather.temperature > 35) cons.push('High temperatures may stress the crop')
+    if (weather.temperature < 15) cons.push('Low temperatures may slow growth')
+    if (soil.ph < 5.5) cons.push('Acidic soil may require lime application')
+    if (soil.ph > 8.0) cons.push('Alkaline soil may need pH correction')
+    if (soil.fertility === 'Low') cons.push('Soil fertility needs improvement')
+    
+    // Crop-specific cons
+    const cropSpecificCons: {[key: string]: string[]} = {
+      'Rice (Basmati)': ['High water requirement', 'Labor intensive harvesting'],
+      'Tomato (Hybrid)': ['Weather sensitive', 'Disease management needed'],
+      'Wheat': ['Heat sensitive during grain filling', 'Storage requires care'],
+      'Cotton': ['Pest management crucial', 'Long growing season'],
+      'Maize (Corn)': ['Market price volatility', 'Pest susceptible']
+    }
+    
+    cons.push(...(cropSpecificCons[cropType] || []).slice(0, 2))
+    
+    return cons.slice(0, 3)
+  }
+  
+  const generateTips = (cropType: string, soil: SoilData, climate: ClimateData): string[] => {
+    const tips: string[] = []
+    
+    // Soil-based tips
+    if (soil.nitrogen < 200) tips.push('Apply nitrogen fertilizer for better yield')
+    if (soil.phosphorus < 20) tips.push('Add phosphorus fertilizer for root development')
+    if (soil.potassium < 120) tips.push('Apply potassium for plant health')
+    
+    // Climate-based tips
+    if (climate.avgRainfall < 600) tips.push('Ensure adequate irrigation during dry periods')
+    if (climate.season === 'Monsoon') tips.push('Plan for proper drainage during heavy rains')
+    
+    // Crop-specific tips
+    const cropSpecificTips: {[key: string]: string[]} = {
+      'Rice (Basmati)': ['Use SRI method for water efficiency', 'Maintain 2-3cm water level'],
+      'Tomato (Hybrid)': ['Use drip irrigation', 'Apply mulching for moisture retention'],
+      'Wheat': ['Sow at optimal time (Nov 15-30)', 'Apply nitrogen in split doses'],
+      'Cotton': ['Monitor for bollworm', 'Maintain proper plant spacing'],
+      'Maize (Corn)': ['Plant at 60x20cm spacing', 'Monitor for fall armyworm']
+    }
+    
+    tips.push(...(cropSpecificTips[cropType] || []))
+    
+    return tips.slice(0, 3)
+  }
+
+  const validateForm = (): boolean => {
+    if (!formData.location) {
+      toast.error('Please provide your location to get crop recommendations')
+      return false
+    }
+    
+    return true
+  }
+
+  const analyzeData = async () => {
+    if (!validateForm()) return
+    
+    setIsAnalyzing(true)
+    
+    try {
+      toast.loading('Analyzing environmental data...', { id: 'analysis' })
+      
+      // Ensure we have complete location data first
+      if (!locationData) {
+        await fetchLocationData()
+      }
+      
+      // Verify we have the required data
+      if (!locationData?.soil || !locationData?.weather || !locationData?.climate) {
+        throw new Error('Incomplete environmental data. Please check your location.')
+      }
+      
+      // Generate real crop recommendations based on API data
+      const cropRecommendations = generateCropRecommendations(locationData)
+      
+      if (cropRecommendations.length === 0) {
+        throw new Error('Unable to generate recommendations with current data')
+      }
+      
+      setRecommendations(cropRecommendations)
+      toast.success(
+        `Analysis completed! Found ${cropRecommendations.length} optimal crop recommendations based on real environmental data.`,
+        { id: 'analysis' }
+      )
+    } catch (error) {
+      console.error('Analysis error:', error)
+      const errorMessage = error instanceof Error ? error.message : 'Analysis failed. Please try again.'
+      toast.error(errorMessage, { id: 'analysis' })
+    } finally {
+      setIsAnalyzing(false)
+    }
+  }
+
+  const getDifficultyColor = (difficulty: string) => {
+    switch (difficulty) {
+      case 'Easy': return 'text-green-600 bg-green-100'
+      case 'Medium': return 'text-yellow-600 bg-yellow-100'
+      case 'Hard': return 'text-red-600 bg-red-100'
+      default: return 'text-gray-600 bg-gray-100'
+    }
+  }
+
+  const getDemandColor = (demand: string) => {
+    switch (demand) {
+      case 'High': return 'text-green-600 bg-green-100'
+      case 'Medium': return 'text-yellow-600 bg-yellow-100'
+      case 'Low': return 'text-red-600 bg-red-100'
+      default: return 'text-gray-600 bg-gray-100'
+    }
+  }
+
+  return (
+    <div className="min-h-screen py-12">
+      <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8">
+        {/* Header */}
+        <motion.div
+          className="text-center mb-12"
+          initial={{ opacity: 0, y: 30 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.6 }}
+        >
+          <div className="flex justify-center mb-6">
+            <div className="w-16 h-16 bg-gradient-to-br from-green-500 to-emerald-600 rounded-2xl flex items-center justify-center">
+              <BeakerIcon className="w-8 h-8 text-white" />
+            </div>
+          </div>
+          <h1 className="text-4xl font-bold mb-4">
+            <span className="gradient-text">Smart Crop Recommendation</span>
+          </h1>
+          <p className="text-xl text-gray-600 max-w-3xl mx-auto">
+            Get AI-powered crop suggestions based on your soil conditions, climate data, 
+            and market trends for maximum profitability
+          </p>
+        </motion.div>
+
+        {!recommendations ? (
+          /* Input Form */
+          <motion.div
+            className="agricultural-card max-w-4xl mx-auto"
+            initial={{ opacity: 0, y: 30 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.6, delay: 0.1 }}
+          >
+            <h2 className="text-2xl font-bold text-gray-800 mb-8 flex items-center">
+              <SparklesIcon className="w-6 h-6 text-green-600 mr-3" />
+              Farm & Soil Information
+            </h2>
+
+            <div className="space-y-8">
+              {/* Location Section */}
+              <div className="space-y-6">
+                <h3 className="text-lg font-semibold text-gray-700 border-b pb-2 flex items-center">
+                  <MapPinIcon className="w-5 h-5 mr-2 text-green-600" />
+                  Farm Location
+                </h3>
+                
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">
+                    <MapPinIcon className="w-4 h-4 inline mr-1" />
+                    Location (City/District) *
+                  </label>
+                  
+                  {/* Location Input with GPS Button */}
+                  <div className="flex space-x-3">
+                    <div className="flex-1 relative">
+                      <input
+                        type="text"
+                        name="location"
+                        value={formData.location}
+                        onChange={handleInputChange}
+                        placeholder={useCurrentLocation ? "GPS location will be detected..." : "Enter city name (e.g., Mumbai, Delhi, Ranchi)"}
+                        className={`agricultural-input pr-10 ${isLocationLoading ? 'bg-gray-50' : ''}`}
+                        disabled={useCurrentLocation && isLocationLoading}
+                      />
+                      {isLocationLoading && (
+                        <div className="absolute right-3 top-1/2 transform -translate-y-1/2">
+                          <div className="loader w-4 h-4"></div>
+                        </div>
+                      )}
+                    </div>
+                    
+                    <div className="flex space-x-2">
+                      <button
+                        type="button"
+                        onClick={getCurrentLocation}
+                        disabled={isLocationLoading}
+                        className={`px-4 py-2 rounded-lg border-2 font-medium transition-all duration-200 flex items-center space-x-2 min-w-[140px] justify-center ${
+                          useCurrentLocation 
+                            ? 'bg-green-100 border-green-500 text-green-700' 
+                            : 'bg-white border-green-500 text-green-600 hover:bg-green-50'
+                        } ${isLocationLoading ? 'opacity-75 cursor-not-allowed' : 'hover:shadow-md'}`}
+                      >
+                        {isLocationLoading ? (
+                          <>
+                            <div className="loader w-4 h-4"></div>
+                            <span className="text-sm">Detecting...</span>
+                          </>
+                        ) : useCurrentLocation ? (
+                          <>
+                            <span className="text-lg">✅</span>
+                            <span className="text-sm">GPS Used</span>
+                          </>
+                        ) : (
+                          <>
+                            <span className="text-lg">📍</span>
+                            <span className="text-sm">Use GPS</span>
+                          </>
+                        )}
+                      </button>
+                      
+                      {/* Skip GPS / Quick Start Button */}
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          const fallbackLocation = 'Palghar, Maharashtra'
+                          setFormData(prev => ({ ...prev, location: fallbackLocation }))
+                          toast.loading('Loading regional data for Maharashtra...', { duration: 3000 })
+                          try {
+                            await fetchLocationDataByName(fallbackLocation)
+                            toast.success('✅ Maharashtra regional data loaded! Ready for crop recommendations.')
+                          } catch (error) {
+                            console.error('Quick start failed:', error)
+                            toast.error('Quick start failed. Please enter location manually.')
+                          }
+                        }}
+                        disabled={isLocationLoading}
+                        className="px-3 py-2 rounded-lg border-2 border-blue-500 text-blue-600 hover:bg-blue-50 font-medium transition-all duration-200 flex items-center space-x-2 text-sm hover:shadow-md"
+                        title="Skip GPS and use Maharashtra regional data"
+                      >
+                        <span>⚡</span>
+                        <span>Quick Start</span>
+                      </button>
+                    </div>
+                  </div>
+                  
+                  {/* Location Data Preview */}
+                  {locationData && (
+                    <div className="mt-3 p-3 bg-green-50 rounded-lg border border-green-200">
+                      <div className="flex items-center space-x-2 mb-2">
+                        <span className="text-green-600 font-medium text-sm">🌍 Location Data Loaded</span>
+                      </div>
+                      <div className="grid grid-cols-2 gap-2 text-xs">
+                        <div>
+                          <span className="text-gray-600">Climate: </span>
+                          <span className="font-medium">{locationData.climate.season}</span>
+                        </div>
+                        <div>
+                          <span className="text-gray-600">Rainfall: </span>
+                          <span className="font-medium">{locationData.weather.rainfall}mm</span>
+                        </div>
+                        <div>
+                          <span className="text-gray-600">Temperature: </span>
+                          <span className="font-medium">{locationData.weather.temperature}°C</span>
+                        </div>
+                        <div>
+                          <span className="text-gray-600">Humidity: </span>
+                          <span className="font-medium">{locationData.weather.humidity}%</span>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                  
+                  <div className="mt-2 text-xs text-gray-500">
+                    💡 <strong>Tip:</strong> Use "Quick Start" for instant setup, "Use GPS" for precise location, or manually type cities like "Mumbai", "Pune", "Nashik"
+                  </div>
+                </div>
+              </div>
+
+              {/* Soil Properties - Auto-filled from location data */}
+              {locationData && (
+                <div className="space-y-6">
+                  <h3 className="text-lg font-semibold text-gray-700 border-b pb-2 flex items-center">
+                    <BeakerIcon className="w-5 h-5 mr-2 text-green-600" />
+                    Soil Properties (Auto-detected)
+                  </h3>
+                
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">
+                    Soil Type *
+                  </label>
+                  <select
+                    name="soilType"
+                    value={formData.soilType}
+                    onChange={handleInputChange}
+                    className="agricultural-select"
+                  >
+                    <option value="">Select Soil Type</option>
+                    {soilTypes.map(soil => (
+                      <option key={soil} value={soil}>{soil}</option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">
+                    Soil pH Level
+                  </label>
+                  <input
+                    type="number"
+                    name="soilPh"
+                    value={formData.soilPh}
+                    onChange={handleInputChange}
+                    placeholder="e.g., 6.5"
+                    className="agricultural-input"
+                    min="0"
+                    max="14"
+                    step="0.1"
+                  />
+                </div>
+
+                <div className="grid grid-cols-3 gap-4">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      Nitrogen (kg/ha)
+                    </label>
+                    <input
+                      type="number"
+                      name="nitrogen"
+                      value={formData.nitrogen}
+                      onChange={handleInputChange}
+                      placeholder="N"
+                      className="agricultural-input"
+                      min="0"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      Phosphorus (kg/ha)
+                    </label>
+                    <input
+                      type="number"
+                      name="phosphorus"
+                      value={formData.phosphorus}
+                      onChange={handleInputChange}
+                      placeholder="P"
+                      className="agricultural-input"
+                      min="0"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      Potassium (kg/ha)
+                    </label>
+                    <input
+                      type="number"
+                      name="potassium"
+                      value={formData.potassium}
+                      onChange={handleInputChange}
+                      placeholder="K"
+                      className="agricultural-input"
+                      min="0"
+                    />
+                  </div>
+                </div>
+
+                  <div className="bg-blue-50 rounded-lg p-3 border border-blue-200">
+                    <div className="text-sm text-blue-800">
+                      <strong>📈 Auto-filled Data:</strong> Soil properties have been automatically determined based on your location's geological and climatic conditions.
+                    </div>
+                  </div>
+                </div>
+              )}
+              
+              {/* Smart Analysis Info */}
+              <div className="bg-gradient-to-r from-green-50 to-blue-50 rounded-lg p-6 border border-green-200">
+                <div className="text-center">
+                  <div className="text-3xl mb-3">🌱🤖</div>
+                  <h3 className="text-lg font-semibold text-gray-800 mb-2">AI-Powered Crop Intelligence</h3>
+                  <p className="text-sm text-gray-600 mb-4">
+                    Our advanced AI analyzes your location's climate patterns, soil composition, 
+                    seasonal trends, and current market prices to recommend the most profitable crops.
+                  </p>
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-xs">
+                    <div className="bg-white rounded-lg p-3">
+                      <div className="text-lg mb-1">🌤️</div>
+                      <div className="font-medium">Weather Analysis</div>
+                    </div>
+                    <div className="bg-white rounded-lg p-3">
+                      <div className="text-lg mb-1">🌱</div>
+                      <div className="font-medium">Soil Intelligence</div>
+                    </div>
+                    <div className="bg-white rounded-lg p-3">
+                      <div className="text-lg mb-1">📈</div>
+                      <div className="font-medium">Market Trends</div>
+                    </div>
+                    <div className="bg-white rounded-lg p-3">
+                      <div className="text-lg mb-1">🏆</div>
+                      <div className="font-medium">Profit Optimization</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="mt-8 text-center">
+              <button
+                onClick={analyzeData}
+                disabled={isAnalyzing}
+                className={`agricultural-button text-lg px-8 py-4 ${
+                  isAnalyzing ? 'opacity-75 cursor-not-allowed' : ''
+                }`}
+              >
+                {isAnalyzing ? (
+                  <>
+                    <div className="loader w-6 h-6 mr-3"></div>
+                    Analyzing Your Farm Data...
+                  </>
+                ) : (
+                  <>
+                    <SparklesIcon className="w-6 h-6 mr-3" />
+                    Get Crop Recommendations
+                  </>
+                )}
+              </button>
+              
+              {isAnalyzing && (
+                <p className="text-sm text-gray-600 mt-4">
+                  Our AI is analyzing soil conditions, weather patterns, and market data...
+                </p>
+              )}
+            </div>
+          </motion.div>
+        ) : (
+          /* Recommendations Display */
+          <AnimatePresence>
+            <motion.div
+              className="space-y-8"
+              initial={{ opacity: 0, y: 30 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.6 }}
+            >
+              {/* Summary Header */}
+              <div className="agricultural-card text-center">
+                <div className="flex justify-center mb-4">
+                  <TrophyIcon className="w-12 h-12 text-yellow-500" />
+                </div>
+                <h2 className="text-3xl font-bold text-gray-800 mb-2">
+                  Your Personalized Crop Recommendations
+                </h2>
+                <p className="text-gray-600">
+                  Based on your location: <strong>{formData.location}</strong>
+                </p>
+                <p className="text-sm text-green-600 mt-2">
+                  📈 Profit calculations are shown per hectare for easy scaling to your farm size
+                </p>
+                {locationData && (
+                  <div className="mt-3 inline-flex items-center space-x-4 text-sm">
+                    <span className="px-3 py-1 bg-green-100 text-green-700 rounded-full">
+                      🌡️ {locationData.weather.temperature}°C
+                    </span>
+                    <span className="px-3 py-1 bg-blue-100 text-blue-700 rounded-full">
+                      💧 {locationData.weather.rainfall}mm rainfall
+                    </span>
+                    <span className="px-3 py-1 bg-orange-100 text-orange-700 rounded-full">
+                      🌱 {locationData.soil.soilType}
+                    </span>
+                  </div>
+                )}
+              </div>
+
+              {/* Recommendations List */}
+              <div className="grid gap-8">
+                {recommendations.map((crop, index) => (
+                  <motion.div
+                    key={crop.name}
+                    className={`agricultural-card border-l-4 ${
+                      index === 0 
+                        ? 'border-l-green-500 bg-green-50/30' 
+                        : index === 1
+                        ? 'border-l-blue-500 bg-blue-50/30'
+                        : 'border-l-orange-500 bg-orange-50/30'
+                    }`}
+                    initial={{ opacity: 0, x: -30 }}
+                    animate={{ opacity: 1, x: 0 }}
+                    transition={{ duration: 0.6, delay: index * 0.1 }}
+                  >
+                    <div className="flex items-start justify-between mb-6">
+                      <div className="flex items-center space-x-4">
+                        <div className="text-4xl">{crop.emoji}</div>
+                        <div>
+                          <h3 className="text-2xl font-bold text-gray-800 flex items-center">
+                            {crop.name}
+                            {index === 0 && (
+                              <span className="ml-3 px-3 py-1 bg-green-100 text-green-800 text-sm font-medium rounded-full">
+                                🏆 Top Recommendation
+                              </span>
+                            )}
+                          </h3>
+                          <div className="flex items-center space-x-4 mt-2">
+                            <div className="text-lg font-semibold text-green-600">
+                              {crop.confidence}% Match
+                            </div>
+                            <div className={`px-2 py-1 rounded-full text-xs font-medium ${getDifficultyColor(crop.difficulty)}`}>
+                              {crop.difficulty}
+                            </div>
+                            <div className={`px-2 py-1 rounded-full text-xs font-medium ${getDemandColor(crop.marketDemand)}`}>
+                              {crop.marketDemand} Demand
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Key Metrics with Profit Calculator */}
+                    <div className="bg-gradient-to-r from-green-50 to-blue-50 rounded-xl p-6 mb-8 border border-green-200">
+                      <div className="text-center mb-4">
+                        <h4 className="text-lg font-bold text-gray-800 mb-1">💰 Profit Calculator (Per Hectare)</h4>
+                        <p className="text-sm text-gray-600">Scale these numbers according to your farm size</p>
+                      </div>
+                      <div className="grid md:grid-cols-4 gap-4">
+                        <div className="bg-white rounded-lg p-4 border border-gray-200 text-center">
+                          <div className="text-xs text-gray-600 mb-1">Expected Yield</div>
+                          <div className="font-bold text-green-600 text-sm">{crop.expectedYield}</div>
+                        </div>
+                        <div className="bg-white rounded-lg p-4 border border-gray-200 text-center">
+                          <div className="text-xs text-gray-600 mb-1">📈 Net Profit</div>
+                          <div className="font-bold text-green-600 text-sm">{crop.profitMargin}</div>
+                        </div>
+                        <div className="bg-white rounded-lg p-4 border border-gray-200 text-center">
+                          <div className="text-xs text-gray-600 mb-1">💵 Investment</div>
+                          <div className="font-bold text-orange-600 text-sm">{crop.investmentRequired}</div>
+                        </div>
+                        <div className="bg-white rounded-lg p-4 border border-gray-200 text-center">
+                          <div className="text-xs text-gray-600 mb-1">⏱️ Duration</div>
+                          <div className="font-bold text-blue-600 text-sm">{crop.duration}</div>
+                        </div>
+                      </div>
+                      
+                      {/* Quick Calculation Examples */}
+                      <div className="mt-4 p-3 bg-white rounded-lg border border-gray-200">
+                        <div className="text-xs font-semibold text-gray-700 mb-2">📉 Quick Scale Calculator:</div>
+                        <div className="grid grid-cols-3 gap-4 text-xs text-center">
+                          <div>
+                            <div className="font-medium text-green-700">1 Acre Farm</div>
+                            <div className="text-green-600">~₹{Math.round(parseInt(crop.profitMargin.match(/₹([\d,]+)/)?.[1]?.replace(',', '') || '0') * 0.4).toLocaleString()}</div>
+                          </div>
+                          <div>
+                            <div className="font-medium text-green-700">5 Acre Farm</div>
+                            <div className="text-green-600">~₹{Math.round(parseInt(crop.profitMargin.match(/₹([\d,]+)/)?.[1]?.replace(',', '') || '0') * 2).toLocaleString()}</div>
+                          </div>
+                          <div>
+                            <div className="font-medium text-green-700">10 Acre Farm</div>
+                            <div className="text-green-600">~₹{Math.round(parseInt(crop.profitMargin.match(/₹([\d,]+)/)?.[1]?.replace(',', '') || '0') * 4).toLocaleString()}</div>
+                          </div>
+                        </div>
+                        <div className="text-xs text-gray-500 mt-2 text-center">
+                          * 1 Hectare = 2.47 Acres approximately
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Pros and Cons */}
+                    <div className="grid md:grid-cols-2 gap-8 mb-6">
+                      <div>
+                        <h4 className="font-semibold text-green-800 mb-3 flex items-center">
+                          <ShieldCheckIcon className="w-5 h-5 mr-2" />
+                          Advantages
+                        </h4>
+                        <ul className="space-y-2">
+                          {crop.pros.map((pro, idx) => (
+                            <li key={idx} className="flex items-start space-x-2 text-sm">
+                              <div className="w-2 h-2 bg-green-500 rounded-full mt-2 flex-shrink-0"></div>
+                              <span className="text-gray-700">{pro}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                      <div>
+                        <h4 className="font-semibold text-red-800 mb-3 flex items-center">
+                          <ExclamationTriangleIcon className="w-5 h-5 mr-2" />
+                          Considerations
+                        </h4>
+                        <ul className="space-y-2">
+                          {crop.cons.map((con, idx) => (
+                            <li key={idx} className="flex items-start space-x-2 text-sm">
+                              <div className="w-2 h-2 bg-red-500 rounded-full mt-2 flex-shrink-0"></div>
+                              <span className="text-gray-700">{con}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    </div>
+
+                    {/* Tips */}
+                    <div className="bg-blue-50 rounded-xl p-4">
+                      <h4 className="font-semibold text-blue-800 mb-3">💡 Expert Tips</h4>
+                      <ul className="space-y-1">
+                        {crop.tips.map((tip, idx) => (
+                          <li key={idx} className="text-sm text-blue-700">
+                            • {tip}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  </motion.div>
+                ))}
+              </div>
+
+              {/* Action Buttons */}
+              <div className="flex flex-col sm:flex-row gap-4 justify-center pt-8">
+                <button
+                  onClick={() => {
+                    setRecommendations(null)
+                    setLocationData(null)
+                    setUseCurrentLocation(false)
+                    setFormData({
+                      location: '',
+                      coordinates: null,
+                      soilType: '',
+                      soilPh: '',
+                      nitrogen: '',
+                      phosphorus: '',
+                      potassium: ''
+                    })
+                  }}
+                  className="agricultural-button flex items-center justify-center space-x-2"
+                >
+                  <BeakerIcon className="w-5 h-5" />
+                  <span>Get New Recommendations</span>
+                </button>
+                <button
+                  onClick={() => window.print()}
+                  className="agricultural-button-secondary flex items-center justify-center space-x-2"
+                >
+                  <span>📄</span>
+                  <span>Print Recommendations</span>
+                </button>
+              </div>
+            </motion.div>
+          </AnimatePresence>
+        )}
+      </div>
+    </div>
+  )
+}
+
+export default CropRecommendation
