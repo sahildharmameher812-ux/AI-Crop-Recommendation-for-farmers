@@ -49,7 +49,7 @@ const Navbar: React.FC = () => {
 
   const isActive = (path: string) => location.pathname === path
   
-  const handleNavClick = (item: typeof navigationItems[0], e: React.MouseEvent) => {
+  const handleNavClick = (_item: typeof navigationItems[0], _e: React.MouseEvent) => {
     // No special handling needed - all navigation uses regular routing
   }
 

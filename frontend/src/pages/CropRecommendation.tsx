@@ -20,9 +20,9 @@ interface FormData {
   coordinates: { lat: number; lng: number } | null
   soilType: string
   soilPh: string
-  nitrogen: number
-  phosphorus: number
-  potassium: number
+  nitrogen: number | string
+  phosphorus: number | string
+  potassium: number | string
   ph: number
 }
 
@@ -496,7 +496,7 @@ ${helpText}
       await new Promise(resolve => setTimeout(resolve, 1000))
       
       // Location-specific soil and weather data
-      let locationSoilData = {
+      let locationSoilData: any = {
         ph: 6.2,
         nitrogen: 190,
         phosphorus: 28,

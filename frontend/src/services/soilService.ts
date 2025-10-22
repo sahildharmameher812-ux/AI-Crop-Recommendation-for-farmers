@@ -3,12 +3,14 @@ interface SoilData {
   nitrogen: number
   phosphorus: number
   potassium: number
-  organicCarbon: number
+  organicCarbon?: number
+  organicMatter?: number
   soilType: string
-  soilClass: string
-  drainage: string
+  soilClass?: string
+  drainage?: string
   fertility: 'Low' | 'Medium' | 'High'
-  recommendations: string[]
+  moisture?: number
+  recommendations?: string[]
 }
 
 interface SoilProperties {
