@@ -8,6 +8,7 @@
     "build": "tsc && vite build",
     "lint": "eslint .",
     "preview": "vite preview",
+    "serve": "node serve.js",
     "serve:proxy": "node server.js"
   },
   "dependencies": {
